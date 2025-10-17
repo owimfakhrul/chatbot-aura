@@ -10,3 +10,4 @@ numpy
 nltk
 PyMuPDF
 python-multipart
+torch
