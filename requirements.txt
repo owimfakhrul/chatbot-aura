@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+pytesseract
+pdf2image
+Pillow
+sentence-transformers
+faiss-cpu
+requests
+numpy
+nltk
+PyMuPDF
+python-multipart
