@@ -25,10 +25,19 @@ from sentence_transformers import SentenceTransformer
 from sentence_transformers.cross_encoder import CrossEncoder
 import faiss
 
-# 🔧 BATASI THREAD (HEMAT RAM)
+# ======================================================
+# 🔧 OPTIMALISASI CPU & RAM UNTUK RENDER FREE TIER
+# ======================================================
 torch.set_num_threads(1)
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
 
-# ========== CONFIG ==========
+# ======================================================
+# CONFIG
+# ======================================================
 UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
@@ -49,35 +58,44 @@ RERANKER_MODEL = "cross-encoder/qnli-distilroberta-base"
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 if not OPENROUTER_API_KEY:
     raise ValueError("OPENROUTER_API_KEY belum diatur di environment variable!")
+
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 OPENROUTER_MODEL = "mistralai/Mistral-7B-Instruct-v0.3"
 
-OCR_WORKERS = 2  # kurangi worker agar hemat RAM
+OCR_WORKERS = 2
 EMBED_BATCH = 16
 TOP_K = 10
 RERANK_TOP_K = 4
 CONTEXT_CHAR_LIMIT = 9000
 MAX_UPLOAD_SIZE = 500 * 1024 * 1024
 
-# ========== LOGGING ==========
+# ======================================================
+# LOGGING
+# ======================================================
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.WARNING,  # ubah ke WARNING agar tidak terlalu berat di Render
     format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[logging.FileHandler("app.log"), logging.StreamHandler()]
+    handlers=[logging.StreamHandler()]
 )
 logger = logging.getLogger(__name__)
 
-# ========== FASTAPI ==========
+# ======================================================
+# FASTAPI
+# ======================================================
 app = FastAPI()
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
-# ========== MODELS ==========
-logger.info("Memuat model embedding dan reranker ringan (optimasi untuk Render)...")
+# ======================================================
+# MODEL LOADING
+# ======================================================
+logger.warning("⏳ Memuat model ringan untuk Render...")
 embed_model = SentenceTransformer(EMBED_MODEL_NAME)
 reranker = CrossEncoder(RERANKER_MODEL)
-logger.info("Model siap digunakan.")
+logger.warning("✅ Model siap digunakan.")
 
-# ========== SQLITE HELPERS ==========
+# ======================================================
+# SQLITE
+# ======================================================
 def init_db():
     conn = sqlite3.connect(SQLITE_FILE, check_same_thread=False)
     cur = conn.cursor()
@@ -95,17 +113,19 @@ def init_db():
 
 db_conn = init_db()
 
-# ========== FAISS HELPERS ==========
+# ======================================================
+# FAISS
+# ======================================================
 def load_or_create_faiss(dim: int):
     if os.path.exists(INDEX_FILE):
         try:
             index = faiss.read_index(INDEX_FILE)
             if not isinstance(index, faiss.IndexIDMap):
                 index = faiss.IndexIDMap(index)
-            logger.info("Index FAISS dimuat dari disk.")
+            logger.warning("📂 Index FAISS dimuat dari disk.")
             return index
         except Exception as e:
-            logger.warning(f"Gagal memuat index lama: {e}. Membuat index baru.")
+            logger.warning(f"Gagal memuat index lama: {e}")
     quant = faiss.IndexFlatIP(dim)
     return faiss.IndexIDMap(quant)
 
@@ -113,17 +133,13 @@ faiss_index = None
 if os.path.exists(INDEX_FILE):
     try:
         faiss_index = faiss.read_index(INDEX_FILE)
-        logger.info("Index FAISS dimuat dari file repository.")
+        logger.warning("✅ Index FAISS dimuat dari repository.")
     except Exception as e:
-        logger.warning(f"Gagal memuat FAISS index: {e}")
+        logger.warning(f"⚠️ Gagal memuat FAISS index: {e}")
 
-if not os.path.exists(SQLITE_FILE):
-    db_conn = init_db()
-else:
-    db_conn = sqlite3.connect(SQLITE_FILE, check_same_thread=False)
-    logger.info("Database metadata dimuat dari file repository.")
-
-# ========== UTILITIES ==========
+# ======================================================
+# UTILITIES
+# ======================================================
 def clean_text(text: str) -> str:
     return re.sub(r"\s+", " ", text.replace("\x00", " ")).strip()
 
@@ -143,7 +159,9 @@ def chunk_text_by_sentence(text: str, chunk_size=700, overlap=100) -> List[str]:
 def generate_int64_id():
     return np.int64(uuid.uuid4().int & ((1 << 63) - 1))
 
-# ========== OCR & PDF EXTRACTION ==========
+# ======================================================
+# OCR & PDF
+# ======================================================
 def preprocess_image(img: Image.Image) -> Image.Image:
     try:
         osd = pytesseract.image_to_osd(img)
@@ -165,7 +183,7 @@ def ocr_page_worker(file_path: str, page_number: int) -> str:
             text += pytesseract.image_to_string(img, lang="ind") + "\n"
         return text
     except Exception as e:
-        logger.error(f"OCR gagal pada {file_path} halaman {page_number}: {e}")
+        logger.error(f"OCR gagal pada halaman {page_number}: {e}")
         return ""
 
 def extract_text_from_pdf(file_path: str) -> str:
@@ -186,33 +204,9 @@ def extract_text_from_pdf(file_path: str) -> str:
             all_text[i - 1] = clean_text(r)
     return "\n".join([t for t in all_text if t])
 
-# ========== STORAGE ==========
-def add_chunks_to_store(filename: str, chunks: List[str]):
-    global faiss_index
-    if not chunks:
-        return []
-    embeddings = np.vstack([
-        embed_model.encode(batch, convert_to_numpy=True, normalize_embeddings=True)
-        for batch in [chunks[i:i + EMBED_BATCH] for i in range(0, len(chunks), EMBED_BATCH)]
-    ])
-    dim = embeddings.shape[1]
-    if faiss_index is None:
-        faiss_index = load_or_create_faiss(dim)
-    cur = db_conn.cursor()
-    ids = []
-    for chunk in chunks:
-        int_id = int(generate_int64_id())
-        u = str(uuid.uuid4())
-        cur.execute("INSERT INTO chunks (id, uuid, text, filename, page) VALUES (?, ?, ?, ?, ?)",
-                    (int_id, u, chunk, filename, -1))
-        ids.append(int_id)
-    db_conn.commit()
-    faiss_index.add_with_ids(embeddings, np.array(ids, dtype=np.int64))
-    faiss.write_index(faiss_index, INDEX_FILE)
-    logger.info(f"Menambahkan {len(chunks)} potongan ke index dan metadata.")
-    return ids
-
-# ========== RETRIEVAL ==========
+# ======================================================
+# RETRIEVAL
+# ======================================================
 def retrieve_relevant_snippets(question: str, top_k=TOP_K):
     global faiss_index
     if faiss_index is None and os.path.exists(INDEX_FILE):
@@ -250,14 +244,21 @@ def rerank_snippets(question: str, snippets: List[str], top_n=RERANK_TOP_K):
     combined.sort(key=lambda x: x[1], reverse=True)
     return [s for s, sc in combined if sc > 0.3][:top_n]
 
-# ========== LLM ==========
+# ======================================================
+# LLM CALL
+# ======================================================
 def call_llm_with_context(question: str, context_snippets: List[str]) -> str:
     context = "\n\n".join(context_snippets)[:CONTEXT_CHAR_LIMIT] if context_snippets else ""
-    system_instructions = (
-        "Kamu adalah asisten AI yang menjawab pertanyaan dalam Bahasa Indonesia. "
-        "Gunakan konteks yang diberikan jika relevan. Jika konteks tidak cukup, balas dengan: Belum tersedia informasi."
-    )
-    prompt = f"{system_instructions}\n\nKonteks:\n{context}\n\nPertanyaan:\n{question}"
+    prompt = f"""
+Kamu adalah asisten AI dalam Bahasa Indonesia. Gunakan konteks jika relevan. 
+Jika konteks tidak cukup, balas: Belum tersedia informasi.
+
+Konteks:
+{context}
+
+Pertanyaan:
+{question}
+"""
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -270,29 +271,12 @@ def call_llm_with_context(question: str, context_snippets: List[str]) -> str:
         res.raise_for_status()
         return res.json()["choices"][0]["message"]["content"].strip()
     except Exception as e:
-        logger.error(f"Error memanggil LLM: {e}")
+        logger.error(f"Error LLM: {e}")
         return "Belum tersedia informasi"
 
-# ========== ENDPOINTS ==========
-@app.post("/upload_pdf")
-async def upload_pdf(files: List[UploadFile]):
-    total_chunks = 0
-    for file in files:
-        if not file.filename.lower().endswith(".pdf"):
-            return JSONResponse(status_code=400, content={"message": "Hanya file PDF yang diperbolehkan."})
-        contents = await file.read()
-        if len(contents) > MAX_UPLOAD_SIZE:
-            return JSONResponse(status_code=400, content={"message": "Ukuran file melebihi batas."})
-        path = os.path.join(UPLOAD_FOLDER, file.filename)
-        with open(path, "wb") as f:
-            f.write(contents)
-        text = extract_text_from_pdf(path)
-        if not text:
-            continue
-        chunks = chunk_text_by_sentence(text)
-        total_chunks += len(add_chunks_to_store(file.filename, chunks))
-    return {"message": f"Berhasil memproses {len(files)} file, total potongan baru: {total_chunks}"}
-
+# ======================================================
+# ENDPOINTS
+# ======================================================
 @app.post("/ask")
 async def ask(question: str = Form(...)):
     try:
@@ -310,9 +294,10 @@ async def ask(question: str = Form(...)):
 def health():
     return {"status": "ok"}
 
-# ========== RUN ==========
+# ======================================================
+# RUN (Untuk Render)
+# ======================================================
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))  # agar cocok dengan Render
-    uvicorn.run("app:app", host="0.0.0.0", port=port)
-
+    port = int(os.getenv("PORT", 10000))
+    uvicorn.run("app:app", host="0.0.0.0", port=port, timeout_keep_alive=30)
