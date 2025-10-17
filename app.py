@@ -32,8 +32,13 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # ========== FASTAPI ==========
-app = FastAPI()
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app = FastAPI(title="AURA Chatbot Backend")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"]
+)
 
 # ========== LOAD STATIC INDEX & DB ==========
 logger.info("📦 Memuat FAISS index dan database prebuilt...")
@@ -41,44 +46,56 @@ faiss_index = None
 if os.path.exists(INDEX_FILE):
     try:
         faiss_index = faiss.read_index(INDEX_FILE)
-        logger.info("FAISS index dimuat dari file repository.")
+        logger.info("✅ FAISS index dimuat dari file repository.")
     except Exception as e:
         logger.warning(f"Gagal memuat FAISS index: {e}")
 else:
-    logger.warning("Tidak menemukan file pdf_index.faiss!")
+    logger.warning("⚠️ Tidak menemukan file pdf_index.faiss — chatbot akan berjalan tanpa konteks PDF.")
 
 db_conn = None
 if os.path.exists(SQLITE_FILE):
     db_conn = sqlite3.connect(SQLITE_FILE, check_same_thread=False)
-    logger.info("Database metadata dimuat dari file repository.")
+    logger.info("✅ Database metadata dimuat dari file repository.")
 else:
-    logger.warning("Tidak menemukan file metadata.db!")
+    logger.warning("⚠️ Tidak menemukan file metadata.db.")
 
-# ========== RETRIEVAL ==========
+# ========== RETRIEVAL (DISABLED FOR LIGHT MODE) ==========
 def retrieve_relevant_snippets(question: str, top_k=TOP_K) -> List[str]:
-    if faiss_index is None or db_conn is None:
-        return []
-
-    # (Karena model embedding tidak dijalankan di server,
-    # kamu harus memastikan index sudah dibuat di lokal)
-    # Placeholder: chatbot tidak bisa mencari konteks baru
-    # Jadi hanya mengembalikan konteks default kosong
-    return []
+    return []  # Tidak digunakan di mode ringan
 
 # ========== LLM CALL ==========
+def clean_output(text: str) -> str:
+    """Membersihkan tag [OUT]...[/OUT], markdown, dan tanda coret."""
+    if not text:
+        return "Belum tersedia informasi"
+
+    # Ambil hanya isi dalam [OUT]...[/OUT] jika ada
+    out_match = re.findall(r"\[OUT\](.*?)\[/OUT\]", text, flags=re.DOTALL)
+    if out_match:
+        text = " ".join(out_match).strip()
+
+    # Hapus markdown (bold, italic, coret, dsb)
+    text = re.sub(r"[*_~`]+", "", text)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Bersihkan sisa tag atau bracket aneh
+    text = text.replace("[/OUT]", "").replace("[OUT]", "")
+    return text.strip()
+
 def call_llm_with_context(question: str, context_snippets: List[str]) -> str:
     context = "\n\n".join(context_snippets)[:CONTEXT_CHAR_LIMIT] if context_snippets else ""
     system_instructions = (
         "Kamu adalah asisten AI yang menjawab pertanyaan dalam Bahasa Indonesia. "
-        "Gunakan konteks yang diberikan jika relevan. Jika konteks tidak cukup, balas dengan: Belum tersedia informasi."
+        "Gunakan konteks yang diberikan jika relevan. Jika konteks tidak cukup, balas dengan: Belum tersedia informasi. "
+        "Keluarkan jawaban final kamu di antara tag [OUT] dan [/OUT]."
     )
     prompt = f"{system_instructions}\n\nKonteks:\n{context}\n\nPertanyaan:\n{question}"
 
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
-        "HTTP-Referer": "http://localhost:8000",
-        "X-Title": "Hybrid PDF Chatbot"
+        "HTTP-Referer": "https://chatbot-aura.onrender.com",
+        "X-Title": "AURA Chatbot"
     }
 
     payload = {
@@ -91,7 +108,8 @@ def call_llm_with_context(question: str, context_snippets: List[str]) -> str:
     try:
         res = requests.post(OPENROUTER_URL, headers=headers, json=payload, timeout=60)
         res.raise_for_status()
-        return res.json()["choices"][0]["message"]["content"].strip()
+        raw_text = res.json()["choices"][0]["message"]["content"].strip()
+        return clean_output(raw_text)
     except Exception as e:
         logger.error(f"Error memanggil LLM: {e}")
         return "Belum tersedia informasi"
@@ -100,7 +118,6 @@ def call_llm_with_context(question: str, context_snippets: List[str]) -> str:
 @app.post("/ask")
 async def ask(question: str = Form(...)):
     try:
-        # Karena index statis, kita panggil LLM langsung
         answer = call_llm_with_context(question, [])
         return {"answer": answer, "context_used": 0}
     except Exception as e:
