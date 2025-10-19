@@ -40,6 +40,17 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+# ========== ROOT ENDPOINT ==========
+@app.get("/")
+def home():
+    return {
+        "message": "🤖 AURA Chatbot API is running successfully on Render!",
+        "endpoints": {
+            "ask": "/ask (POST, Form: question)",
+            "health": "/health"
+        }
+    }
+
 # ========== LOAD STATIC INDEX & DB ==========
 logger.info("📦 Memuat FAISS index dan database prebuilt...")
 faiss_index = None
@@ -59,7 +70,7 @@ if os.path.exists(SQLITE_FILE):
 else:
     logger.warning("⚠️ Tidak menemukan file metadata.db.")
 
-# ========== RETRIEVAL (DISABLED FOR LIGHT MODE) ==========
+# ========== RETRIEVAL (DISABLED UNTUK MODE RINGAN) ==========
 def retrieve_relevant_snippets(question: str, top_k=TOP_K) -> List[str]:
     return []  # Tidak digunakan di mode ringan
 
@@ -69,16 +80,12 @@ def clean_output(text: str) -> str:
     if not text:
         return "Belum tersedia informasi"
 
-    # Ambil hanya isi dalam [OUT]...[/OUT] jika ada
     out_match = re.findall(r"\[OUT\](.*?)\[/OUT\]", text, flags=re.DOTALL)
     if out_match:
         text = " ".join(out_match).strip()
 
-    # Hapus markdown (bold, italic, coret, dsb)
     text = re.sub(r"[*_~`]+", "", text)
     text = re.sub(r"\s+", " ", text).strip()
-
-    # Bersihkan sisa tag atau bracket aneh
     text = text.replace("[/OUT]", "").replace("[OUT]", "")
     return text.strip()
 
@@ -128,7 +135,14 @@ async def ask(question: str = Form(...)):
 def health():
     return {"status": "ok"}
 
-# ========== RUN ==========
+# ========== SHUTDOWN HANDLER ==========
+@app.on_event("shutdown")
+def shutdown_event():
+    if db_conn:
+        db_conn.close()
+        logger.info("🔒 Database connection closed.")
+
+# ========== RUN LOCALLY ==========
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", 8000))
